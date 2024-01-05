@@ -28,14 +28,20 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.time.Instant;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class CalculateAverage_bufistov1 {
+
+    static final long LINE_SEPARATOR = '\n';
+    // static final Threadlong newLines = 0;
 
     public static class FileRead implements Callable<Long> {
 
         private FileChannel _channel;
         private long _startLocation;
         private int _size;
+
+        private long newLines = 0;
 
         public FileRead(long loc, int size, FileChannel chnl) {
             _startLocation = loc;
@@ -47,8 +53,11 @@ public class CalculateAverage_bufistov1 {
         public Long call() throws IOException {
             try {
                 log("Reading the channel: " + _startLocation + ":" + _size);
+                byte[] suffix = new byte[128];
+                if (_startLocation > 0) {
+                    toLineBegin(suffix);
+                }
                 int bufferSize = 1 << 24;
-                long result = 0;
                 while (_size > 0) {
                     if (_size < bufferSize) {
                         bufferSize = _size;
@@ -56,17 +65,54 @@ public class CalculateAverage_bufistov1 {
                     MappedByteBuffer byteBuffer = _channel.map(FileChannel.MapMode.READ_ONLY, _startLocation, bufferSize);
                     _size -= bufferSize;
                     _startLocation += bufferSize;
-                    result += lineSum2(byteBuffer);
+                    int suffixBytes = 0;
+                    if (_size > 0) {
+                        suffixBytes = toLineBegin(suffix);
+                    }
+                    countLines(byteBuffer, suffix, suffixBytes);
                 }
-
                 log("Done Reading the channel: " + _startLocation + ":" + _size);
-                return result;
-
+                return newLines;
             }
             catch (Exception e) {
                 e.printStackTrace();
                 throw e;
             }
+        }
+
+        byte getByte(long position) throws IOException {
+            MappedByteBuffer byteBuffer = _channel.map(FileChannel.MapMode.READ_ONLY, position, 1);
+            return byteBuffer.get();
+        }
+
+        int toLineBegin(byte[] suffix) throws IOException {
+            int bytesConsumed = 0;
+            if (getByte(_startLocation - 1) != LINE_SEPARATOR) {
+                while (getByte(_startLocation) != LINE_SEPARATOR) {
+                    suffix[bytesConsumed++] = getByte(_startLocation);
+                    ++_startLocation;
+                    --_size;
+                }
+            }
+            if (bytesConsumed > 0) {
+                ++_startLocation;
+                --_size;
+                ++newLines;
+            }
+            return bytesConsumed;
+        }
+
+        long countLines(MappedByteBuffer byteBuffer, byte[] suffix, int suffixBytes) {
+            byte nextByte;
+            long result = 0;
+            while (byteBuffer.hasRemaining()) {
+                nextByte = byteBuffer.get();
+                result += nextByte;
+                if (nextByte == LINE_SEPARATOR) {
+                    newLines += 1L;
+                }
+            }
+            return result;
         }
     }
 
@@ -91,7 +137,7 @@ public class CalculateAverage_bufistov1 {
         }
 
         // load the last remaining piece
-        executor.submit(new FileRead(start_loc, toIntExact(remaining_size), channel));
+        results.add(executor.submit(new FileRead(start_loc, toIntExact(remaining_size), channel)));
         executor.shutdown();
 
         // Wait for all threads to finish
@@ -106,6 +152,7 @@ public class CalculateAverage_bufistov1 {
             result += future.get();
         }
         log("Result: " + result);
+        // log("Total lines: " + newLines);
     }
 
     static long lineSum(String row) {
