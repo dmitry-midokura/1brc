@@ -19,7 +19,11 @@ import static java.lang.Math.toIntExact;
 
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -28,20 +32,79 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.time.Instant;
 import java.util.concurrent.Future;
-import java.util.concurrent.atomic.AtomicLong;
+
+class ResultRow {
+    byte[] station;
+
+    String stationString;
+    long min, max, count, suma;
+
+    ResultRow(byte[] station, long value) {
+        this.station = new byte[station.length];
+        System.arraycopy(station, 0, this.station, 0, station.length);
+        this.min = value;
+        this.max = value;
+        this.count = 1;
+        this.suma = value;
+    }
+
+    public String toString() {
+        stationString = new String(station, StandardCharsets.UTF_8);
+        return stationString + "=" + round(min / 10.0) + "/" + round(suma / 10.0 / count) + "/" + round(max / 10.0);
+    }
+
+    private double round(double value) {
+        return Math.round(value * 10.0) / 10.0;
+    }
+
+    ResultRow update(long newValue) {
+        this.count += 1;
+        this.suma += newValue;
+        if (newValue < this.min) {
+            this.min = newValue;
+        }
+        else if (newValue > this.max) {
+            this.max = newValue;
+        }
+        return this;
+    }
+
+    ResultRow merge(ResultRow another) {
+        this.count += another.count;
+        this.suma += another.suma;
+        this.min = Math.min(this.min, another.min);
+        this.max = Math.max(this.max, another.max);
+        return this;
+    }
+}
+
+class ByteArrayWrapper {
+    private final byte[] data;
+
+    public ByteArrayWrapper(byte[] data) {
+        this.data = data;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        return Arrays.equals(data, ((ByteArrayWrapper) other).data);
+    }
+
+    @Override
+    public int hashCode() {
+        return Arrays.hashCode(data);
+    }
+}
 
 public class CalculateAverage_bufistov1 {
 
     static final long LINE_SEPARATOR = '\n';
-    // static final Threadlong newLines = 0;
 
-    public static class FileRead implements Callable<Long> {
+    public static class FileRead implements Callable<HashMap<ByteArrayWrapper, ResultRow>> {
 
         private FileChannel _channel;
         private long _startLocation;
         private int _size;
-
-        private long newLines = 0;
 
         public FileRead(long loc, int size, FileChannel chnl) {
             _startLocation = loc;
@@ -50,29 +113,27 @@ public class CalculateAverage_bufistov1 {
         }
 
         @Override
-        public Long call() throws IOException {
+        public HashMap<ByteArrayWrapper, ResultRow> call() throws IOException {
             try {
+                HashMap<ByteArrayWrapper, ResultRow> result = new HashMap<>(10000);
                 log("Reading the channel: " + _startLocation + ":" + _size);
                 byte[] suffix = new byte[128];
                 if (_startLocation > 0) {
                     toLineBegin(suffix);
                 }
-                int bufferSize = 1 << 24;
                 while (_size > 0) {
-                    if (_size < bufferSize) {
-                        bufferSize = _size;
-                    }
+                    int bufferSize = Math.min(1 << 24, _size);
                     MappedByteBuffer byteBuffer = _channel.map(FileChannel.MapMode.READ_ONLY, _startLocation, bufferSize);
                     _size -= bufferSize;
                     _startLocation += bufferSize;
                     int suffixBytes = 0;
-                    if (_size > 0) {
+                    if (_startLocation < _channel.size()) {
                         suffixBytes = toLineBegin(suffix);
                     }
-                    countLines(byteBuffer, suffix, suffixBytes);
+                    processChunk(byteBuffer, bufferSize, suffix, suffixBytes, result);
                 }
                 log("Done Reading the channel: " + _startLocation + ":" + _size);
-                return newLines;
+                return result;
             }
             catch (Exception e) {
                 e.printStackTrace();
@@ -88,56 +149,122 @@ public class CalculateAverage_bufistov1 {
         int toLineBegin(byte[] suffix) throws IOException {
             int bytesConsumed = 0;
             if (getByte(_startLocation - 1) != LINE_SEPARATOR) {
-                while (getByte(_startLocation) != LINE_SEPARATOR) {
+                while (getByte(_startLocation) != LINE_SEPARATOR) { // Small bug here if last chunk is less than a line and has now '\n' at the end
                     suffix[bytesConsumed++] = getByte(_startLocation);
                     ++_startLocation;
                     --_size;
                 }
-            }
-            if (bytesConsumed > 0) {
                 ++_startLocation;
                 --_size;
-                ++newLines;
             }
             return bytesConsumed;
         }
 
-        long countLines(MappedByteBuffer byteBuffer, byte[] suffix, int suffixBytes) {
-            byte nextByte;
-            long result = 0;
-            while (byteBuffer.hasRemaining()) {
-                nextByte = byteBuffer.get();
-                result += nextByte;
-                if (nextByte == LINE_SEPARATOR) {
-                    newLines += 1L;
+        void processChunk(MappedByteBuffer byteBuffer, int bufferSize, byte[] suffix, int suffixBytes, HashMap<ByteArrayWrapper, ResultRow> result) {
+            int nameBegin = 0;
+            int numberBegin = -1;
+            byte[] stationName = null;
+
+            for (int currentPosition = 0; currentPosition < bufferSize; ++currentPosition) {
+                byte nextByte = byteBuffer.get(currentPosition);
+                if (nextByte == ';') {
+                    stationName = new byte[currentPosition - nameBegin];
+                    byteBuffer.slice(nameBegin, stationName.length).get(stationName, 0, stationName.length);
+                    numberBegin = currentPosition + 1;
+                }
+                else if (nextByte == LINE_SEPARATOR) {
+                    long value = getValue(byteBuffer, numberBegin, currentPosition);
+                    // log("Station name: '" + new String(stationName, StandardCharsets.UTF_8) + "' value: " + value);
+                    ResultRow row = new ResultRow(stationName, value);
+                    var byteKey = new ByteArrayWrapper(stationName);
+                    result.merge(byteKey, row, (old, x) -> old.update(x.suma));
+                    nameBegin = currentPosition + 1;
+                    stationName = null;
                 }
             }
-            return result;
+            if (nameBegin < bufferSize) {
+                byte[] lastLine = new byte[bufferSize - nameBegin + suffixBytes];
+                byte[] prefix = new byte[bufferSize - nameBegin];
+                byteBuffer.slice(nameBegin, prefix.length).get(prefix, 0, prefix.length);
+                System.arraycopy(prefix, 0, lastLine, 0, prefix.length);
+                System.arraycopy(suffix, 0, lastLine, prefix.length, suffixBytes);
+                processLastLine(lastLine, result);
+            }
+        }
+
+        void processLastLine(byte[] lastLine, HashMap<ByteArrayWrapper, ResultRow> result) {
+            int numberBegin = -1;
+            byte[] stationName = null;
+            for (int i = 0; i < lastLine.length; ++i) {
+                byte nextByte = lastLine[i];
+                if (nextByte == ';') {
+                    stationName = new byte[i];
+                    System.arraycopy(lastLine, 0, stationName, 0, stationName.length);
+                    numberBegin = i + 1;
+                }
+            }
+            long value = getValue(lastLine, numberBegin);
+            ResultRow row = new ResultRow(stationName, value);
+            var byteKey = new ByteArrayWrapper(stationName);
+            result.merge(byteKey, row, (current, x) -> current.update(x.suma));
+        }
+
+        long getValue(MappedByteBuffer byteBuffer, int startLocation, int endLocation) {
+            byte nextByte = byteBuffer.get(startLocation);
+            boolean negate = nextByte == '-';
+            long result = negate ? 0 : nextByte - '0';
+            for (int i = startLocation + 1; i < endLocation; ++i) {
+                nextByte = byteBuffer.get(i);
+                if (nextByte != '.') {
+                    result *= 10;
+                    result += nextByte - '0';
+                }
+            }
+            return negate ? -result : result;
+        }
+
+        long getValue(byte[] lastLine, int startLocation) {
+            byte nextByte = lastLine[startLocation];
+            boolean negate = nextByte == '-';
+            long result = negate ? 0 : nextByte - '0';
+            for (int i = startLocation + 1; i < lastLine.length; ++i) {
+                nextByte = lastLine[i];
+                if (nextByte != '.') {
+                    result *= 10;
+                    result += nextByte - '0';
+                }
+            }
+            return negate ? -result : result;
         }
     }
 
     public static void main(String[] args) throws Exception {
-        FileInputStream fileInputStream = new FileInputStream(args[0]);
-        int numThreads = Integer.parseInt(args[1]);
-        log("File: " + args[0]);
-        log("numThreads: " + numThreads);
+        String fileName = "measurements.txt";
+        if (args.length > 0 && args[0].length() > 0) {
+            fileName = args[0];
+        }
+        log("InputFile: " + fileName);
+        FileInputStream fileInputStream = new FileInputStream(fileName);
+        int numThreads = 8;
+        if (args.length > 1) {
+            numThreads = Integer.parseInt(args[1]);
+        }
+        log("NumThreads: " + numThreads);
         FileChannel channel = fileInputStream.getChannel();
         final long fileSize = channel.size();
         long remaining_size = fileSize;
-        long chunk_size = Math.min(fileSize / numThreads, Integer.MAX_VALUE - 5);
+        long chunk_size = Math.min((fileSize + numThreads - 1) / numThreads, Integer.MAX_VALUE - 5);
 
         ExecutorService executor = Executors.newFixedThreadPool(numThreads);
 
-        long start_loc = 0;
-        ArrayList<Future<Long>> results = new ArrayList<>(numThreads);
-        while (remaining_size >= chunk_size) {
-            results.add(executor.submit(new FileRead(start_loc, toIntExact(chunk_size), channel)));
-            remaining_size = remaining_size - chunk_size;
-            start_loc = start_loc + chunk_size;
+        long startLocation = 0;
+        ArrayList<Future<HashMap<ByteArrayWrapper, ResultRow>>> results = new ArrayList<>(numThreads);
+        while (remaining_size > 0) {
+            long actualSize = Math.min(chunk_size, remaining_size);
+            results.add(executor.submit(new FileRead(startLocation, toIntExact(actualSize), channel)));
+            remaining_size -= actualSize;
+            startLocation += actualSize;
         }
-
-        // load the last remaining piece
-        results.add(executor.submit(new FileRead(start_loc, toIntExact(remaining_size), channel)));
         executor.shutdown();
 
         // Wait for all threads to finish
@@ -146,40 +273,23 @@ public class CalculateAverage_bufistov1 {
         }
         log("Finished all threads");
         fileInputStream.close();
-        long result = 0;
+        HashMap<ByteArrayWrapper, ResultRow> result = new HashMap<>(20000);
         for (var future : results) {
             assert future.isDone();
-            result += future.get();
+            for (var entry : future.get().entrySet()) {
+                result.merge(entry.getKey(), entry.getValue(), ResultRow::merge);
+            }
         }
-        log("Result: " + result);
-        // log("Total lines: " + newLines);
-    }
-
-    static long lineSum(String row) {
-        long result = 0;
-        for (int i = 0; i < row.length(); ++i) {
-            result += row.charAt(i);
+        ResultRow[] finalResult = result.values().toArray(new ResultRow[0]);
+        for (var row : finalResult) {
+            row.toString();
         }
-        return result;
-    }
-
-    static long lineSum1(byte[] row) {
-        long result = 0;
-        for (byte b : row) {
-            result += b;
-        }
-        return result;
-    }
-
-    static long lineSum2(MappedByteBuffer byteBuffer) {
-        long result = 0;
-        while (byteBuffer.hasRemaining()) {
-            result += byteBuffer.get();
-        }
-        return result;
+        Arrays.sort(finalResult, Comparator.comparing(a -> a.stationString));
+        System.out.println("{" + String.join(", ", Arrays.stream(finalResult).map(ResultRow::toString).toList()) + "}");
+        log("All done!");
     }
 
     static void log(String message) {
-        System.out.println(Instant.now() + "[" + Thread.currentThread().getName() + "]: " + message);
+       // System.err.println(Instant.now() + "[" + Thread.currentThread().getName() + "]: " + message);
     }
 }

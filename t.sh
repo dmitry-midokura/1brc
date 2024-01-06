@@ -15,7 +15,16 @@
 #  limitations under the License.
 #
 
+if [ -z "$1" ]
+  then
+    echo "Usage: test.sh <fork name>"
+    exit 1
+fi
 
-JAVA_OPTS="-verbose:gc -Xms8g"
-time /home/dmitry/.jdks/openjdk-21.0.1/bin/java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_bufistov1 \
-data/1B.txt 8
+mvn clean package
+
+for sample in $(ls src/test/resources/samples/*.txt)
+do
+  echo "Validating calculate_average_$1.sh -- $sample"
+  diff <(./calculate_average_$1.sh $sample 4) ${sample%.txt}.out
+done
