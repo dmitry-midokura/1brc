@@ -38,6 +38,9 @@ class ResultRow {
     String stationString;
     long min, max, count, suma;
 
+    ResultRow() {
+    }
+
     ResultRow(byte[] station, long value) {
         this.station = new byte[station.length];
         System.arraycopy(station, 0, this.station, 0, station.length);
@@ -45,6 +48,18 @@ class ResultRow {
         this.max = value;
         this.count = 1;
         this.suma = value;
+    }
+
+    ResultRow(long value) {
+        this.min = value;
+        this.max = value;
+        this.count = 1;
+        this.suma = value;
+    }
+
+    void setStation(MappedByteBuffer byteBuffer, int startPosition, int endPosition) {
+        this.station = new byte[endPosition - startPosition];
+        byteBuffer.slice(startPosition, station.length).get(this.station, 0, station.length);
     }
 
     public String toString() {
@@ -95,6 +110,83 @@ class ByteArrayWrapper {
     }
 }
 
+class OpenHash {
+    ResultRow[] data;
+    int dataSizeMask;
+
+    // ResultRow metrics = new ResultRow();
+
+    public OpenHash(int capacityPow2) {
+        assert capacityPow2 <= 20;
+        int dataSize = 1 << capacityPow2;
+        dataSizeMask = dataSize - 1;
+        data = new ResultRow[dataSize];
+    }
+
+    int hashByteArray(byte[] array) {
+        int result = 0;
+        long mask = 0;
+        for (int i = 0; i < array.length; ++i, mask = ((mask + 1) & 3)) {
+            result += array[i] << mask;
+        }
+        return result & dataSizeMask;
+    }
+
+    void merge(byte[] station, long value, int hashValue) {
+        while (data[hashValue] != null && !Arrays.equals(station, data[hashValue].station)) {
+            hashValue += 1;
+            hashValue &= dataSizeMask;
+        }
+        if (data[hashValue] == null) {
+            data[hashValue] = new ResultRow(station, value);
+        }
+        else {
+            data[hashValue].update(value);
+        }
+        // metrics.update(delta);
+    }
+
+    void merge(byte[] station, long value) {
+        merge(station, value, hashByteArray(station));
+    }
+
+    void merge(MappedByteBuffer byteBuffer, final int startPosition, final int endPosition, int hashValue, final long value) {
+        while (data[hashValue] != null && !equalsToStation(byteBuffer, startPosition, endPosition, data[hashValue].station)) {
+            hashValue += 1;
+            hashValue &= dataSizeMask;
+        }
+        if (data[hashValue] == null) {
+            data[hashValue] = new ResultRow(value);
+            data[hashValue].setStation(byteBuffer, startPosition, endPosition);
+        }
+        else {
+            data[hashValue].update(value);
+        }
+    }
+
+    boolean equalsToStation(MappedByteBuffer byteBuffer, int startPosition, int endPosition, byte[] station) {
+        if (endPosition - startPosition != station.length) {
+            return false;
+        }
+        for (int i = 0; i < station.length; ++i, ++startPosition) {
+            if (byteBuffer.get(startPosition) != station[i])
+                return false;
+        }
+        return true;
+    }
+
+    HashMap<ByteArrayWrapper, ResultRow> toJavaHashMap() {
+        HashMap<ByteArrayWrapper, ResultRow> result = new HashMap<>(20000);
+        for (int i = 0; i < data.length; ++i) {
+            if (data[i] != null) {
+                var key = new ByteArrayWrapper(data[i].station);
+                result.put(key, data[i]);
+            }
+        }
+        return result;
+    }
+}
+
 public class CalculateAverage_bufistov1 {
 
     static final long LINE_SEPARATOR = '\n';
@@ -105,6 +197,9 @@ public class CalculateAverage_bufistov1 {
         private long currentLocation;
         private int bytesToRead;
 
+        private final int hashCapacityPow2 = 13;
+        private final int hashCapacityMask = (1 << hashCapacityPow2) - 1;
+
         public FileRead(long startLocation, int bytesToRead, FileChannel fileChannel) {
             this.currentLocation = startLocation;
             this.bytesToRead = bytesToRead;
@@ -114,7 +209,7 @@ public class CalculateAverage_bufistov1 {
         @Override
         public HashMap<ByteArrayWrapper, ResultRow> call() throws IOException {
             try {
-                HashMap<ByteArrayWrapper, ResultRow> result = new HashMap<>(10000);
+                OpenHash openHash = new OpenHash(hashCapacityPow2);
                 log("Reading the channel: " + currentLocation + ":" + bytesToRead);
                 byte[] suffix = new byte[128];
                 if (currentLocation > 0) {
@@ -129,10 +224,10 @@ public class CalculateAverage_bufistov1 {
                     if (currentLocation < fileChannel.size()) {
                         suffixBytes = toLineBegin(suffix);
                     }
-                    processChunk(byteBuffer, bufferSize, suffix, suffixBytes, result);
+                    processChunk(byteBuffer, bufferSize, suffix, suffixBytes, openHash);
                 }
                 log("Done Reading the channel: " + currentLocation + ":" + bytesToRead);
-                return result;
+                return openHash.toJavaHashMap();
             }
             catch (Exception e) {
                 e.printStackTrace();
@@ -159,26 +254,31 @@ public class CalculateAverage_bufistov1 {
             return bytesConsumed;
         }
 
-        void processChunk(MappedByteBuffer byteBuffer, int bufferSize, byte[] suffix, int suffixBytes, HashMap<ByteArrayWrapper, ResultRow> result) {
+        void processChunk(MappedByteBuffer byteBuffer, int bufferSize, byte[] suffix, int suffixBytes, OpenHash result) {
             int nameBegin = 0;
+            int nameEnd = -1;
             int numberBegin = -1;
-            byte[] stationName = null;
-
+            int currentHash = 0;
+            int currentMask = 0;
+            int nameHash = 0;
             for (int currentPosition = 0; currentPosition < bufferSize; ++currentPosition) {
                 byte nextByte = byteBuffer.get(currentPosition);
                 if (nextByte == ';') {
-                    stationName = new byte[currentPosition - nameBegin];
-                    byteBuffer.slice(nameBegin, stationName.length).get(stationName, 0, stationName.length);
+                    nameEnd = currentPosition;
                     numberBegin = currentPosition + 1;
+                    nameHash = currentHash & hashCapacityMask;
                 }
                 else if (nextByte == LINE_SEPARATOR) {
                     long value = getValue(byteBuffer, numberBegin, currentPosition);
-                    // log("Station name: '" + new String(stationName, StandardCharsets.UTF_8) + "' value: " + value);
-                    ResultRow row = new ResultRow(stationName, value);
-                    var byteKey = new ByteArrayWrapper(stationName);
-                    result.merge(byteKey, row, (old, x) -> old.update(x.suma));
+                    // log("Station name: '" + getStationName(byteBuffer, nameBegin, nameEnd) + "' value: " + value + " hash: " + nameHash);
+                    result.merge(byteBuffer, nameBegin, nameEnd, nameHash, value);
                     nameBegin = currentPosition + 1;
-                    stationName = null;
+                    currentHash = 0;
+                    currentMask = 0;
+                }
+                else {
+                    currentHash += (nextByte << currentMask);
+                    currentMask = (currentMask + 1) & 3;
                 }
             }
             if (nameBegin < bufferSize) {
@@ -191,21 +291,20 @@ public class CalculateAverage_bufistov1 {
             }
         }
 
-        void processLastLine(byte[] lastLine, HashMap<ByteArrayWrapper, ResultRow> result) {
+        void processLastLine(byte[] lastLine, OpenHash result) {
             int numberBegin = -1;
             byte[] stationName = null;
             for (int i = 0; i < lastLine.length; ++i) {
-                byte nextByte = lastLine[i];
-                if (nextByte == ';') {
+                if (lastLine[i] == ';') {
                     stationName = new byte[i];
                     System.arraycopy(lastLine, 0, stationName, 0, stationName.length);
                     numberBegin = i + 1;
+                    break;
                 }
             }
             long value = getValue(lastLine, numberBegin);
-            ResultRow row = new ResultRow(stationName, value);
-            var byteKey = new ByteArrayWrapper(stationName);
-            result.merge(byteKey, row, (current, x) -> current.update(x.suma));
+            // log("Station name: '" + new String(stationName, StandardCharsets.UTF_8) + "' value: " + value);
+            result.merge(stationName, value);
         }
 
         long getValue(MappedByteBuffer byteBuffer, int startLocation, int endLocation) {
@@ -234,6 +333,12 @@ public class CalculateAverage_bufistov1 {
                 }
             }
             return negate ? -result : result;
+        }
+
+        String getStationName(MappedByteBuffer byteBuffer, int from, int to) {
+            byte[] bytes = new byte[to - from];
+            byteBuffer.slice(from, to - from).get(0, bytes);
+            return new String(bytes, StandardCharsets.UTF_8);
         }
     }
 
