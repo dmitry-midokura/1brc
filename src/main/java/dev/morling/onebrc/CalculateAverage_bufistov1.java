@@ -30,7 +30,6 @@ import java.util.concurrent.Executors;
 
 import java.io.FileInputStream;
 import java.io.IOException;
-import java.time.Instant;
 import java.util.concurrent.Future;
 
 class ResultRow {
@@ -102,37 +101,37 @@ public class CalculateAverage_bufistov1 {
 
     public static class FileRead implements Callable<HashMap<ByteArrayWrapper, ResultRow>> {
 
-        private FileChannel _channel;
-        private long _startLocation;
-        private int _size;
+        private final FileChannel fileChannel;
+        private long currentLocation;
+        private int bytesToRead;
 
-        public FileRead(long loc, int size, FileChannel chnl) {
-            _startLocation = loc;
-            _size = size;
-            _channel = chnl;
+        public FileRead(long startLocation, int bytesToRead, FileChannel fileChannel) {
+            this.currentLocation = startLocation;
+            this.bytesToRead = bytesToRead;
+            this.fileChannel = fileChannel;
         }
 
         @Override
         public HashMap<ByteArrayWrapper, ResultRow> call() throws IOException {
             try {
                 HashMap<ByteArrayWrapper, ResultRow> result = new HashMap<>(10000);
-                log("Reading the channel: " + _startLocation + ":" + _size);
+                log("Reading the channel: " + currentLocation + ":" + bytesToRead);
                 byte[] suffix = new byte[128];
-                if (_startLocation > 0) {
+                if (currentLocation > 0) {
                     toLineBegin(suffix);
                 }
-                while (_size > 0) {
-                    int bufferSize = Math.min(1 << 24, _size);
-                    MappedByteBuffer byteBuffer = _channel.map(FileChannel.MapMode.READ_ONLY, _startLocation, bufferSize);
-                    _size -= bufferSize;
-                    _startLocation += bufferSize;
+                while (bytesToRead > 0) {
+                    int bufferSize = Math.min(1 << 24, bytesToRead);
+                    MappedByteBuffer byteBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, currentLocation, bufferSize);
+                    bytesToRead -= bufferSize;
+                    currentLocation += bufferSize;
                     int suffixBytes = 0;
-                    if (_startLocation < _channel.size()) {
+                    if (currentLocation < fileChannel.size()) {
                         suffixBytes = toLineBegin(suffix);
                     }
                     processChunk(byteBuffer, bufferSize, suffix, suffixBytes, result);
                 }
-                log("Done Reading the channel: " + _startLocation + ":" + _size);
+                log("Done Reading the channel: " + currentLocation + ":" + bytesToRead);
                 return result;
             }
             catch (Exception e) {
@@ -142,20 +141,20 @@ public class CalculateAverage_bufistov1 {
         }
 
         byte getByte(long position) throws IOException {
-            MappedByteBuffer byteBuffer = _channel.map(FileChannel.MapMode.READ_ONLY, position, 1);
+            MappedByteBuffer byteBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, position, 1);
             return byteBuffer.get();
         }
 
         int toLineBegin(byte[] suffix) throws IOException {
             int bytesConsumed = 0;
-            if (getByte(_startLocation - 1) != LINE_SEPARATOR) {
-                while (getByte(_startLocation) != LINE_SEPARATOR) { // Small bug here if last chunk is less than a line and has now '\n' at the end
-                    suffix[bytesConsumed++] = getByte(_startLocation);
-                    ++_startLocation;
-                    --_size;
+            if (getByte(currentLocation - 1) != LINE_SEPARATOR) {
+                while (getByte(currentLocation) != LINE_SEPARATOR) { // Small bug here if last chunk is less than a line and has now '\n' at the end
+                    suffix[bytesConsumed++] = getByte(currentLocation);
+                    ++currentLocation;
+                    --bytesToRead;
                 }
-                ++_startLocation;
-                --_size;
+                ++currentLocation;
+                --bytesToRead;
             }
             return bytesConsumed;
         }
@@ -275,7 +274,6 @@ public class CalculateAverage_bufistov1 {
         fileInputStream.close();
         HashMap<ByteArrayWrapper, ResultRow> result = new HashMap<>(20000);
         for (var future : results) {
-            assert future.isDone();
             for (var entry : future.get().entrySet()) {
                 result.merge(entry.getKey(), entry.getValue(), ResultRow::merge);
             }
@@ -290,6 +288,6 @@ public class CalculateAverage_bufistov1 {
     }
 
     static void log(String message) {
-       // System.err.println(Instant.now() + "[" + Thread.currentThread().getName() + "]: " + message);
+        // System.err.println(Instant.now() + "[" + Thread.currentThread().getName() + "]: " + message);
     }
 }
