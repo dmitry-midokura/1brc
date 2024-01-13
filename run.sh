@@ -17,5 +17,5 @@
 
 
 JAVA_OPTS="-verbose:gc -Xms8g"
-time /home/dmitry/.jdks/openjdk-21.0.1/bin/java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_bufistov1 \
-data/1B.txt 8
+time /home/dmitry/.jdks/openjdk-21.0.1/bin/java $JAVA_OPTS --class-path target/average-1.0.0-SNAPSHOT.jar dev.morling.onebrc.CalculateAverage_bufistov \
+data/1B.txt 16
