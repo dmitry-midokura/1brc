@@ -71,7 +71,7 @@ class ResultRow {
         return Math.round(value * 10.0) / 10.0;
     }
 
-    ResultRow update(long newValue) {
+    void update(long newValue) {
         this.count += 1;
         this.suma += newValue;
         if (newValue < this.min) {
@@ -80,7 +80,6 @@ class ResultRow {
         else if (newValue > this.max) {
             this.max = newValue;
         }
-        return this;
     }
 
     ResultRow merge(ResultRow another) {
