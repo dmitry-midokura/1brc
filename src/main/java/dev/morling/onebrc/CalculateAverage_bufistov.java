@@ -215,17 +215,17 @@ public class CalculateAverage_bufistov {
 
     public static class FileRead implements Callable<HashMap<ByteArrayWrapper, ResultRow>> {
 
+        private final FileChannel fileChannel;
+
         private long currentLocation;
         private long bytesToRead;
 
-        private final boolean firstSegment;
-
         private final int hashCapacityPow2 = 18;
 
-        public FileRead(long startLocation, long bytesToRead, boolean firstSegment) {
+        public FileRead(FileChannel fileChannel, long startLocation, long bytesToRead, boolean firstSegment) {
+            this.fileChannel = fileChannel;
             this.currentLocation = startLocation;
             this.bytesToRead = bytesToRead;
-            this.firstSegment = firstSegment;
         }
 
         @Override
@@ -233,11 +233,11 @@ public class CalculateAverage_bufistov {
             try {
                 OpenHash openHash = new OpenHash(hashCapacityPow2);
                 log("Reading the channel: " + currentLocation + ":" + bytesToRead);
-                // byte[] suffix = new byte[128];
-                if (!firstSegment) {
-                    toLineBegin();
-                }
+                toLineBeginPrefix();
                 toLineBeginSuffix();
+                var memorySegment = fileChannel.map(FileChannel.MapMode.READ_ONLY, currentLocation, bytesToRead, Arena.ofShared());
+                currentLocation = memorySegment.address();
+                log("Memory address of the segment: " + currentLocation);
                 processChunk(openHash);
                 log("Done Reading the channel: " + currentLocation + ":" + bytesToRead);
                 return openHash.toJavaHashMap();
@@ -248,26 +248,20 @@ public class CalculateAverage_bufistov {
             }
         }
 
-        /*
-         * byte getByte(long position) throws IOException {
-         * MappedByteBuffer byteBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, position, 1);
-         * return byteBuffer.get();
-         * }
-         */
+        byte getByte(long position) throws IOException {
+            MappedByteBuffer byteBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, position, 1);
+            return byteBuffer.get();
+        }
 
-        void toLineBegin() {
-            if (UNSAFE.getByte(currentLocation - 1) != LINE_SEPARATOR) {
-                while (UNSAFE.getByte(currentLocation) != LINE_SEPARATOR) { // Small bug here if last chunk is less than a line and has no '\n' at the end. Valid input should have '\n' for all rows.
-                    ++currentLocation;
-                    --bytesToRead;
-                }
-                ++currentLocation;
-                --bytesToRead;
+        void toLineBeginPrefix() throws IOException {
+            while (currentLocation > 0 && getByte(currentLocation - 1) != LINE_SEPARATOR) {
+                --currentLocation;
+                ++bytesToRead;
             }
         }
 
-        void toLineBeginSuffix() {
-            while (UNSAFE.getByte(currentLocation + bytesToRead - 1) != LINE_SEPARATOR) { // Small bug here if last chunk is less than a line and has no '\n' at the end. Valid input should have '\n' for all rows.
+        void toLineBeginSuffix() throws IOException {
+            while (getByte(currentLocation + bytesToRead - 1) != LINE_SEPARATOR) {
                 ++bytesToRead;
             }
         }
@@ -290,7 +284,7 @@ public class CalculateAverage_bufistov {
                 }
                 else if (nextByte == LINE_SEPARATOR) {
                     long value = getValue(numberBegin, currentLocation);
-                    log("Station name: '" + getStationName(nameBegin, nameEnd) + "' value: " + value + " hash: " + nameHash);
+                    // log("Station name: '" + getStationName(nameBegin, nameEnd) + "' value: " + value + " hash: " + nameHash);
                     result.merge(nameBegin, nameEnd, nameHash, value);
                     nameBegin = currentLocation + 1;
                     currentHash = 0;
@@ -303,42 +297,12 @@ public class CalculateAverage_bufistov {
             }
         }
 
-        void processLastLine(byte[] lastLine, OpenHash result) {
-            int numberBegin = -1;
-            byte[] stationName = null;
-            for (int i = 0; i < lastLine.length; ++i) {
-                if (lastLine[i] == ';') {
-                    stationName = new byte[i];
-                    System.arraycopy(lastLine, 0, stationName, 0, stationName.length);
-                    numberBegin = i + 1;
-                    break;
-                }
-            }
-            long value = getValue(lastLine, numberBegin);
-            // log("Station name: '" + new String(stationName, StandardCharsets.UTF_8) + "' value: " + value);
-            result.merge(stationName, value);
-        }
-
         long getValue(long startLocation, long endLocation) {
             byte nextByte = UNSAFE.getByte(startLocation);
             boolean negate = nextByte == '-';
             long result = negate ? 0 : nextByte - '0';
             for (long i = startLocation + 1; i < endLocation; ++i) {
                 nextByte = UNSAFE.getByte(i);
-                if (nextByte != '.') {
-                    result *= 10;
-                    result += nextByte - '0';
-                }
-            }
-            return negate ? -result : result;
-        }
-
-        long getValue(byte[] lastLine, int startLocation) {
-            byte nextByte = lastLine[startLocation];
-            boolean negate = nextByte == '-';
-            long result = negate ? 0 : nextByte - '0';
-            for (int i = startLocation + 1; i < lastLine.length; ++i) {
-                nextByte = lastLine[i];
                 if (nextByte != '.') {
                     result *= 10;
                     result += nextByte - '0';
@@ -378,12 +342,10 @@ public class CalculateAverage_bufistov {
         long startLocation = 0;
         ArrayList<Future<HashMap<ByteArrayWrapper, ResultRow>>> results = new ArrayList<>(numThreads);
         var fileChannel = FileChannel.open(Paths.get(fileName));
-        var allMemorySegment = fileChannel.map(FileChannel.MapMode.READ_ONLY, 0, fileSize, Arena.ofShared());
-        long baseAddress = allMemorySegment.address();
         boolean firstSegment = true;
         while (remaining_size > 0) {
             long actualSize = Math.min(chunk_size, remaining_size);
-            results.add(executor.submit(new FileRead(baseAddress + startLocation, toIntExact(actualSize), firstSegment)));
+            results.add(executor.submit(new FileRead(fileChannel, startLocation, toIntExact(actualSize), firstSegment)));
             firstSegment = false;
             remaining_size -= actualSize;
             startLocation += actualSize;
